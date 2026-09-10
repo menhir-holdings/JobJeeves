@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     groq_model: str = "llama-3.1-8b-instant"
 
-    cors_origins: str = "http://localhost:5173,https://jobjeeves.menhir-holdings.com,https://jobjeeves.vercel.app"
+    cors_origins: str = "http://localhost:5173,https://jobjeeves-menhir-holdings.vercel.app,https://jobjeeves.vercel.app"
 
     @property
     def cors_origin_list(self) -> list[str]:
