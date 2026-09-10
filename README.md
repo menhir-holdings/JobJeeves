@@ -74,7 +74,7 @@ npm run dev:frontend
 | Vercel frontend + external API | [README-vercel.md](./README-vercel.md) — legacy split deploy |
 | AWS ECS + Supabase | [README-ecs-supabase.md](./README-ecs-supabase.md) |
 
-**Production:** https://jobjeeves.menhir-holdings.com — see [docs/HAPPY_PATH.md](./docs/HAPPY_PATH.md).
+**Production:** https://jobjeeves-menhir-holdings.vercel.app — see [docs/HAPPY_PATH.md](./docs/HAPPY_PATH.md).
 
 **Env (Vercel):** `GROQ_API_KEY` or `OPENAI_API_KEY`, optional `DATABASE_URL=sqlite:////tmp/jobjeeves.db`, `CORS_ORIGINS` if needed.
 
