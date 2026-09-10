@@ -3,36 +3,129 @@ import { analyzeResume, type AnalyzeResponse } from "./api";
 import { clearBaseResume, loadBaseResume, saveBaseResume } from "./baseResume";
 
 type ResumeMode = "upload" | "paste";
+type AnalysisSource = "groq" | "openai" | "local_heuristic";
+type DeskTab = "opening" | "pipeline";
+type StageId = "file" | "opening" | "screen" | "packet" | "ready";
+
+const STAGES: { id: StageId; label: string; hint: string }[] = [
+  { id: "file", label: "File", hint: "Base résumé" },
+  { id: "opening", label: "Opening", hint: "Role on the desk" },
+  { id: "screen", label: "Screen", hint: "Match & gaps" },
+  { id: "packet", label: "Packet", hint: "Tailored résumé" },
+  { id: "ready", label: "Ready", hint: "Copy or download" },
+];
+
+function firstMeaningfulLine(text: string): string {
+  return (
+    text
+      .split(/\r?\n/)
+      .map((line) => line.trim().replace(/^[#>*\-\d.)\s]+/, ""))
+      .find((line) => line.length > 1 && line.length < 90) ?? ""
+  );
+}
+
+function deriveCandidateName(resumeText: string): string {
+  const line = firstMeaningfulLine(resumeText);
+  if (!line) return "Applicant file";
+  if (/experience|education|summary|skills|objective/i.test(line)) return "Applicant file";
+  return line.slice(0, 48);
+}
+
+function deriveOpeningTitle(jobDescription: string): string {
+  const line = firstMeaningfulLine(jobDescription);
+  if (!line) return "Unassigned opening";
+  return line.replace(/^(job title|role|position)\s*[:\-–]\s*/i, "").slice(0, 64);
+}
+
+function initialsFor(name: string): string {
+  const parts = name.split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "AF";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+}
+
+function stageIndex(id: StageId): number {
+  return STAGES.findIndex((stage) => stage.id === id);
+}
+
+function DeskMark() {
+  return (
+    <svg className="mark" viewBox="0 0 28 28" aria-hidden="true">
+      <rect x="3" y="18" width="22" height="6" rx="1" fill="currentColor" opacity="0.22" />
+      <rect x="7" y="6" width="4.2" height="14" fill="currentColor" />
+      <rect x="12.4" y="4" width="3.4" height="16" fill="currentColor" opacity="0.85" />
+      <rect x="17.2" y="8" width="3.6" height="12" fill="currentColor" opacity="0.7" />
+    </svg>
+  );
+}
+
+function EmptyDesk() {
+  return (
+    <div className="desk-empty">
+      <svg viewBox="0 0 160 88" fill="none" aria-hidden="true">
+        <rect x="18" y="58" width="124" height="8" rx="1" stroke="currentColor" strokeWidth="1.4" />
+        <rect x="44" y="28" width="72" height="34" rx="2" stroke="currentColor" strokeWidth="1.4" />
+        <path d="M52 36h56M52 42h40M52 48h48" stroke="currentColor" strokeWidth="1.2" />
+        <rect x="86" y="18" width="46" height="28" rx="1.5" stroke="currentColor" strokeWidth="1.4" />
+        <circle cx="36" cy="46" r="8" stroke="currentColor" strokeWidth="1.4" />
+      </svg>
+      <h3>No file on the desk</h3>
+      <p>Put a base résumé in File, then pin an opening. Screening starts from there.</p>
+    </div>
+  );
+}
 
 export default function App() {
   const [resumeMode, setResumeMode] = useState<ResumeMode>("upload");
   const [pdf, setPdf] = useState<File | null>(null);
   const [resumeText, setResumeText] = useState("");
   const [jobDescription, setJobDescription] = useState("");
-  const [analysisSource, setAnalysisSource] = useState<"groq" | "openai" | "local_heuristic">("groq");
+  const [analysisSource, setAnalysisSource] = useState<AnalysisSource>("groq");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<AnalyzeResponse | null>(null);
   const [savedHint, setSavedHint] = useState<string | null>(null);
   const [exportHint, setExportHint] = useState<string | null>(null);
+  const [exported, setExported] = useState(false);
+  const [tab, setTab] = useState<DeskTab>("opening");
+  const [focusStage, setFocusStage] = useState<StageId>("file");
+  const [query, setQuery] = useState("");
 
   const hasJobDescription = jobDescription.trim().length > 0;
   const sourceOptions = hasJobDescription
     ? ([
-        { value: "groq", label: "Groq (JD mode)" },
-        { value: "openai", label: "OpenAI (JD mode)" },
+        { value: "groq", label: "Quick screen" },
+        { value: "openai", label: "Senior screen" },
       ] as const)
     : ([
-        { value: "groq", label: "Groq (resume-only)" },
-        { value: "openai", label: "OpenAI (resume-only)" },
-        { value: "local_heuristic", label: "Local heuristic (resume-only, no API)" },
+        { value: "groq", label: "Quick screen" },
+        { value: "openai", label: "Senior screen" },
+        { value: "local_heuristic", label: "Desk check (offline)" },
       ] as const);
 
-  const hasResume = resumeMode === "upload" ? !!pdf : resumeText.trim().length > 0;
+  const hasResume =
+    resumeMode === "upload" ? !!(pdf || resumeText.trim()) : resumeText.trim().length > 0;
+  const canSubmit = hasResume && !loading;
+  const openingTitle = deriveOpeningTitle(jobDescription);
+  const candidateName = deriveCandidateName(resumeText);
+  const tailored = result?.tailored_resume?.trim() ?? "";
 
-  const canSubmit = useMemo(() => {
-    return hasResume && !loading;
-  }, [hasResume, loading]);
+  const earnedStage: StageId | null = useMemo(() => {
+    if (!hasResume) return null;
+    if (exported && tailored) return "ready";
+    if (tailored) return "packet";
+    if (result) return "screen";
+    if (hasJobDescription) return "opening";
+    return "file";
+  }, [exported, hasJobDescription, hasResume, result, tailored]);
+
+  const boardQuery = query.trim().toLowerCase();
+  const cardVisible =
+    Boolean(earnedStage) &&
+    (!boardQuery ||
+      candidateName.toLowerCase().includes(boardQuery) ||
+      openingTitle.toLowerCase().includes(boardQuery) ||
+      STAGES.some((stage) => stage.label.toLowerCase().includes(boardQuery)));
 
   useEffect(() => {
     const saved = loadBaseResume();
@@ -41,9 +134,10 @@ export default function App() {
     setResumeText(saved.text);
     setSavedHint(
       saved.source === "upload"
-        ? `Restored uploaded resume text from this session (${saved.filename ?? "PDF"}).`
-        : "Restored pasted resume from this session.",
+        ? `Session file restored (${saved.filename ?? "PDF"}).`
+        : "Session file restored from paste.",
     );
+    setFocusStage("file");
   }, []);
 
   useEffect(() => {
@@ -64,7 +158,7 @@ export default function App() {
       source,
       updatedAt: new Date().toISOString(),
     });
-    setSavedHint("Base resume saved for this browser session.");
+    setSavedHint("Base résumé is on this desk for the session.");
   }
 
   async function onSubmit(e: React.FormEvent) {
@@ -74,40 +168,51 @@ export default function App() {
     setError(null);
     setResult(null);
     setExportHint(null);
+    setExported(false);
     try {
       const r = await analyzeResume({
         pdf: resumeMode === "upload" ? pdf : null,
-        resumeText: resumeMode === "paste" ? resumeText : undefined,
+        resumeText:
+          resumeMode === "paste" || (!pdf && resumeText.trim()) ? resumeText : undefined,
         jobDescription,
         analysisSource,
       });
       setResult(r);
       const storedText = r.resume_text?.trim() || resumeText.trim();
-      if (resumeMode === "paste") {
-        persistBaseResume(storedText, "paste", null);
-      } else if (pdf && storedText) {
-        persistBaseResume(storedText, "upload", pdf.name);
+      if (storedText) {
+        persistBaseResume(
+          storedText,
+          resumeMode === "paste" || !pdf ? "paste" : "upload",
+          pdf?.name ?? null,
+        );
       }
+      setTab("pipeline");
+      setFocusStage(r.tailored_resume?.trim() ? "packet" : "screen");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      setTab("pipeline");
+      setFocusStage("screen");
     } finally {
       setLoading(false);
     }
   }
 
-  async function onPdfSelected(file: File | null) {
+  function onPdfSelected(file: File | null) {
     setPdf(file);
     if (!file) return;
     setResumeMode("upload");
     setSavedHint(null);
+    setExported(false);
   }
 
   async function copyTailoredResume(text: string) {
     try {
       await navigator.clipboard.writeText(text);
-      setExportHint("Tailored resume copied to clipboard.");
+      setExportHint("Packet copied to the clipboard.");
+      setExported(true);
+      setFocusStage("ready");
     } catch {
-      setExportHint("Could not copy to clipboard — try download instead.");
+      setExportHint("Could not copy — download the packet instead.");
     }
   }
 
@@ -120,218 +225,445 @@ export default function App() {
     anchor.click();
     URL.revokeObjectURL(url);
     setExportHint("Download started.");
+    setExported(true);
+    setFocusStage("ready");
+  }
+
+  function moveStage(direction: -1 | 1) {
+    const next = STAGES[stageIndex(focusStage) + direction];
+    if (!next) return;
+    setFocusStage(next.id);
+    setTab("pipeline");
   }
 
   const submitLabel = hasJobDescription
     ? loading
-      ? "Tailoring..."
-      : "Analyze & tailor"
+      ? "Cutting packet…"
+      : "Screen & cut packet"
     : loading
-      ? "Analyzing..."
-      : "Analyze resume";
+      ? "Marking file…"
+      : "Screen résumé";
 
-  return (
-    <div className="page">
-      <header className="header">
+  const stamp =
+    earnedStage === "ready"
+      ? "Ready"
+      : earnedStage === "packet"
+        ? "Packet"
+        : earnedStage === "screen"
+          ? "Screened"
+          : earnedStage === "opening"
+            ? "Opening pinned"
+            : "On file";
+
+  const resumeFields = (
+    <>
+      <div className="segment" role="tablist" aria-label="Résumé intake">
+        <button
+          type="button"
+          className={resumeMode === "upload" ? "active" : ""}
+          onClick={() => setResumeMode("upload")}
+        >
+          Upload PDF
+        </button>
+        <button
+          type="button"
+          className={resumeMode === "paste" ? "active" : ""}
+          onClick={() => setResumeMode("paste")}
+        >
+          Paste text
+        </button>
+      </div>
+
+      {resumeMode === "upload" ? (
+        <label className="label">
+          Base résumé
+          <input
+            className="input"
+            type="file"
+            accept="application/pdf"
+            onChange={(e) => onPdfSelected(e.target.files?.[0] ?? null)}
+          />
+        </label>
+      ) : (
+        <label className="label">
+          Base résumé
+          <textarea
+            className="textarea"
+            value={resumeText}
+            onChange={(e) => {
+              setResumeText(e.target.value);
+              setExported(false);
+            }}
+            placeholder="Paste the full résumé onto the desk…"
+            rows={12}
+          />
+        </label>
+      )}
+      {savedHint ? <p className="hint">{savedHint}</p> : null}
+    </>
+  );
+
+  const openingFields = (
+    <label className="label">
+      Opening
+      <textarea
+        className="textarea"
+        value={jobDescription}
+        onChange={(e) => {
+          setJobDescription(e.target.value);
+          setExported(false);
+        }}
+        placeholder="Paste the job description. Leave blank to mark the file only."
+        rows={10}
+      />
+    </label>
+  );
+
+  const resultsBody = !result ? (
+    <p className="muted">
+      {hasResume
+        ? "Run a screen to put a mark on this opening."
+        : "File a résumé first — the board stays empty until then."}
+    </p>
+  ) : (
+    <div className="stack">
+      <div className="score-row">
+        <div className="score">{result.match_score}</div>
         <div>
-          <h1>JobJeeves</h1>
-          <p className="sub">
-            Set your base resume once (upload or paste), then analyze against any job description.
+          <div className="score-label">
+            {result.analysis_mode === "resume_only" ? "File readiness" : "Opening match"}
+          </div>
+          <p className="muted">
+            Screen {result.analysis_id} · {result.analysis_engine}
           </p>
         </div>
-      </header>
+      </div>
 
-      <main className="grid">
-        <section className="card">
-          <h2>Analyze</h2>
-          <form onSubmit={onSubmit} className="form">
-            <div className="segment">
-              <button
-                type="button"
-                className={`segment-btn ${resumeMode === "upload" ? "active" : ""}`}
-                onClick={() => setResumeMode("upload")}
-              >
-                Upload PDF
+      {result.short_summary ? (
+        <div className="block">
+          <h3>Desk note</h3>
+          <p>{result.short_summary}</p>
+        </div>
+      ) : null}
+
+      <div className="cols">
+        <div className="block">
+          <h3>
+            {result.analysis_mode === "resume_only" ? "Underplayed keywords" : "Missing keywords"}
+          </h3>
+          {result.missing_keywords.length ? (
+            <ul>
+              {result.missing_keywords.map((keyword) => (
+                <li key={keyword}>{keyword}</li>
+              ))}
+            </ul>
+          ) : (
+            <p className="muted">None marked.</p>
+          )}
+        </div>
+        <div className="block">
+          <h3>Strengths</h3>
+          {result.strengths.length ? (
+            <ul>
+              {result.strengths.map((strength) => (
+                <li key={strength}>{strength}</li>
+              ))}
+            </ul>
+          ) : (
+            <p className="muted">None returned.</p>
+          )}
+        </div>
+      </div>
+
+      <div className="block">
+        <h3>What to tighten</h3>
+        {result.improvement_suggestions.length ? (
+          <ol>
+            {result.improvement_suggestions.map((suggestion) => (
+              <li key={suggestion}>{suggestion}</li>
+            ))}
+          </ol>
+        ) : (
+          <p className="muted">No notes returned.</p>
+        )}
+      </div>
+    </div>
+  );
+
+  const packetBody = tailored ? (
+    <div className="block">
+      <div className="blockHeader">
+        <h3>Tailored packet</h3>
+        <div className="action-row">
+          <button type="button" className="secondary" onClick={() => copyTailoredResume(tailored)}>
+            Copy
+          </button>
+          <button type="button" className="secondary" onClick={() => downloadTailoredResume(tailored)}>
+            Download
+          </button>
+        </div>
+      </div>
+      {exportHint ? <p className="hint">{exportHint}</p> : null}
+      <pre className="tailor">{tailored}</pre>
+    </div>
+  ) : result?.analysis_mode === "job_match" ? (
+    <p className="muted">This screen did not return a tailored packet.</p>
+  ) : (
+    <p className="muted">Pin an opening and screen it to cut a packet.</p>
+  );
+
+  return (
+    <div className="app">
+      <aside className="rail">
+        <div className="brand">
+          <DeskMark />
+          <div>
+            <p className="brand-name">JobJeeves</p>
+            <p className="brand-kicker">Hiring desk</p>
+          </div>
+        </div>
+
+        <nav className="rail-nav" aria-label="Desk">
+          <button
+            type="button"
+            className={`rail-btn ${tab === "pipeline" ? "active" : ""}`}
+            onClick={() => setTab("pipeline")}
+          >
+            <span className="rail-dot" />
+            <span className="rail-label">
+              <strong>Pipeline</strong>
+              <span>Paper stages</span>
+            </span>
+          </button>
+          <button
+            type="button"
+            className={`rail-btn ${tab === "opening" ? "active" : ""}`}
+            onClick={() => {
+              setTab("opening");
+              setFocusStage("opening");
+            }}
+          >
+            <span className="rail-dot" />
+            <span className="rail-label">
+              <strong>Opening</strong>
+              <span>Role + file</span>
+            </span>
+          </button>
+        </nav>
+
+        <div className="rail-section">
+          <h2>On desk</h2>
+          <button
+            type="button"
+            className={`job-chip ${tab === "pipeline" ? "active" : ""}`}
+            onClick={() => setTab("pipeline")}
+          >
+            <span className="rail-dot" />
+            <span className="rail-label">
+              <strong>{openingTitle}</strong>
+              <span>{hasResume ? candidateName : "No file yet"}</span>
+            </span>
+          </button>
+        </div>
+
+        <div className="rail-foot">
+          <label className="engine-label">
+            Screen
+            <select
+              className="select"
+              value={analysisSource}
+              onChange={(e) => setAnalysisSource(e.target.value as AnalysisSource)}
+            >
+              {sourceOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      </aside>
+
+      <div className="desk">
+        <header className="mast">
+          <div>
+            <h1 className="opening-title">{openingTitle}</h1>
+            <p className="opening-meta">
+              {hasResume ? candidateName : "Empty blotter"} · Session desk ·{" "}
+              {hasJobDescription ? "Opening pinned" : "No opening yet"}
+            </p>
+          </div>
+          <div className="tabs" role="tablist" aria-label="Desk views">
+            <button
+              type="button"
+              className={`tab ${tab === "opening" ? "active" : ""}`}
+              onClick={() => setTab("opening")}
+            >
+              Opening
+            </button>
+            <button
+              type="button"
+              className={`tab ${tab === "pipeline" ? "active" : ""}`}
+              onClick={() => setTab("pipeline")}
+            >
+              Pipeline
+            </button>
+          </div>
+        </header>
+
+        <div className="toolbar">
+          <label className="search">
+            <span className="sr-only">Search the pipeline</span>
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search file or opening"
+            />
+          </label>
+          <div className="toolbar-actions">
+            <div className="stage-move" aria-label="Move stage">
+              <button type="button" onClick={() => moveStage(-1)} disabled={stageIndex(focusStage) === 0}>
+                ←
               </button>
               <button
                 type="button"
-                className={`segment-btn ${resumeMode === "paste" ? "active" : ""}`}
-                onClick={() => setResumeMode("paste")}
+                onClick={() => moveStage(1)}
+                disabled={stageIndex(focusStage) === STAGES.length - 1}
               >
-                Paste text
+                →
               </button>
             </div>
-
-            {resumeMode === "upload" ? (
-              <label className="label">
-                Resume PDF
-                <input
-                  className="input"
-                  type="file"
-                  accept="application/pdf"
-                  onChange={(e) => onPdfSelected(e.target.files?.[0] ?? null)}
-                />
-              </label>
-            ) : (
-              <label className="label">
-                Base resume
-                <textarea
-                  className="textarea"
-                  value={resumeText}
-                  onChange={(e) => setResumeText(e.target.value)}
-                  placeholder="Paste your full resume text here..."
-                  rows={12}
-                />
-              </label>
-            )}
-
-            {savedHint ? <p className="hint">{savedHint}</p> : null}
-
-            <label className="label">
-              Job description (optional)
-              <textarea
-                className="textarea"
-                value={jobDescription}
-                onChange={(e) => setJobDescription(e.target.value)}
-                placeholder="Paste the full job description here (or leave blank for resume-only mode)..."
-                rows={10}
-              />
-            </label>
-
-            <label className="label">
-              Analysis source
-              <select
-                className="input"
-                value={analysisSource}
-                onChange={(e) =>
-                  setAnalysisSource(e.target.value as "groq" | "openai" | "local_heuristic")
-                }
-              >
-                {sourceOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <button className="button" disabled={!canSubmit} type="submit">
+            <button className="primary" disabled={!canSubmit} form="desk-form" type="submit">
               {submitLabel}
             </button>
+          </div>
+        </div>
 
-            {error ? <div className="error">{error}</div> : null}
-          </form>
-        </section>
-
-        <section className="card">
-          <h2>Results</h2>
-          {!result ? (
-            <p className="muted">Run an analysis to see results.</p>
-          ) : (
-            <div className="results">
-              <div className="scoreRow">
-                <div className="score">{result.match_score}</div>
-                <div>
-                  <div className="scoreLabel">
-                    {result.analysis_mode === "resume_only"
-                      ? "Resume readiness score (0–100)"
-                      : "Match score (0–100)"}
+        {tab === "pipeline" ? (
+          <div className="board-wrap">
+            <div className="board" role="list" aria-label="Hiring pipeline">
+              {STAGES.map((stage) => (
+                <section
+                  key={stage.id}
+                  className={`column ${focusStage === stage.id ? "active" : ""}`}
+                  role="listitem"
+                >
+                  <button
+                    type="button"
+                    className="column-hit"
+                    onClick={() => setFocusStage(stage.id)}
+                    aria-pressed={focusStage === stage.id}
+                  >
+                    <span className="column-head">
+                      <span className="column-title">{stage.label}</span>
+                      <span className="column-count">{cardVisible && focusStage === stage.id ? 1 : 0}</span>
+                    </span>
+                  </button>
+                  <div className="column-body">
+                    {cardVisible && focusStage === stage.id ? (
+                      <div className="card">
+                        <div className="who">
+                          <span className="avatar">{initialsFor(candidateName)}</span>
+                          <span>
+                            <strong>{candidateName}</strong>
+                            <small>{openingTitle}</small>
+                          </span>
+                        </div>
+                        <span className="stamp">{stamp}</span>
+                      </div>
+                    ) : earnedStage ? (
+                      <p className="empty-col">{stage.hint}</p>
+                    ) : (
+                      <p className="empty-col" />
+                    )}
                   </div>
-                  <div className="muted">
-                    Analysis ID: {result.analysis_id} · Engine: {result.analysis_engine}
-                  </div>
-                </div>
-              </div>
-
-              {result.short_summary ? (
-                <div className="block">
-                  <h3>Summary</h3>
-                  <p>{result.short_summary}</p>
-                </div>
-              ) : null}
-
-              <div className="cols">
-                <div className="block">
-                  <h3>
-                    {result.analysis_mode === "resume_only"
-                      ? "Potentially missing/underemphasized keywords"
-                      : "Missing keywords"}
-                  </h3>
-                  {result.missing_keywords.length ? (
-                    <ul>
-                      {result.missing_keywords.map((k) => (
-                        <li key={k}>{k}</li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="muted">None detected.</p>
-                  )}
-                </div>
-
-                <div className="block">
-                  <h3>Strengths</h3>
-                  {result.strengths.length ? (
-                    <ul>
-                      {result.strengths.map((s) => (
-                        <li key={s}>{s}</li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="muted">No strengths returned.</p>
-                  )}
-                </div>
-              </div>
-
-              <div className="block">
-                <h3>Improvement suggestions</h3>
-                {result.improvement_suggestions.length ? (
-                  <ol>
-                    {result.improvement_suggestions.map((s) => (
-                      <li key={s}>{s}</li>
-                    ))}
-                  </ol>
-                ) : (
-                  <p className="muted">No suggestions returned.</p>
-                )}
-              </div>
-
-              {result.tailored_resume?.trim() ? (
-                <div className="block">
-                  <div className="blockHeader">
-                    <h3>Tailored resume</h3>
-                    <div className="actionRow">
-                      <button
-                        type="button"
-                        className="button secondary"
-                        onClick={() => copyTailoredResume(result.tailored_resume ?? "")}
-                      >
-                        Copy
-                      </button>
-                      <button
-                        type="button"
-                        className="button secondary"
-                        onClick={() => downloadTailoredResume(result.tailored_resume ?? "")}
-                      >
-                        Download
-                      </button>
-                    </div>
-                  </div>
-                  {exportHint ? <p className="hint">{exportHint}</p> : null}
-                  <pre className="tailorOutput">{result.tailored_resume}</pre>
-                </div>
-              ) : result.analysis_mode === "job_match" ? (
-                <p className="muted">No tailored resume returned for this run.</p>
-              ) : null}
+                </section>
+              ))}
             </div>
-          )}
-        </section>
-      </main>
+            {!earnedStage ? <EmptyDesk /> : null}
+          </div>
+        ) : null}
 
-      <footer className="footer">
-        <span className="muted">
-          Base resume persists in this browser tab session. PDF uploads still require extractable text.
-        </span>
-      </footer>
+        <div className="sheet-wrap">
+          <form
+            id="desk-form"
+            className={`sheet${tab === "opening" ? " intake" : ""}`}
+            onSubmit={onSubmit}
+          >
+            {tab === "opening" ? (
+              <>
+                <div className="sheet-head">
+                  <div>
+                    <h2>Opening file</h2>
+                    <p>
+                      Keep the base résumé on the blotter, pin a role, then screen. This is a hiring
+                      desk, not a job board.
+                    </p>
+                  </div>
+                </div>
+                <div className="stack">{resumeFields}</div>
+                <div className="stack">
+                  {openingFields}
+                  {error ? <div className="error">{error}</div> : null}
+                </div>
+              </>
+            ) : null}
+
+            {tab === "pipeline" && focusStage === "file" ? (
+              <div className="stack span-all">
+                <div className="sheet-head">
+                  <div>
+                    <h2>File</h2>
+                    <p>Session résumé on the desk.</p>
+                  </div>
+                </div>
+                {resumeFields}
+              </div>
+            ) : null}
+
+            {tab === "pipeline" && focusStage === "opening" ? (
+              <div className="stack span-all">
+                <div className="sheet-head">
+                  <div>
+                    <h2>Opening</h2>
+                    <p>The role this packet is cut against.</p>
+                  </div>
+                </div>
+                {openingFields}
+              </div>
+            ) : null}
+
+            {tab === "pipeline" && focusStage === "screen" ? (
+              <div className="stack span-all">
+                <div className="sheet-head">
+                  <div>
+                    <h2>Screen</h2>
+                    <p>Match mark, gaps, and what to tighten before the packet leaves the desk.</p>
+                  </div>
+                </div>
+                {error ? <div className="error">{error}</div> : null}
+                {resultsBody}
+              </div>
+            ) : null}
+
+            {tab === "pipeline" && (focusStage === "packet" || focusStage === "ready") ? (
+              <div className="stack span-all">
+                <div className="sheet-head">
+                  <div>
+                    <h2>{focusStage === "ready" ? "Ready to send" : "Packet"}</h2>
+                    <p>
+                      {focusStage === "ready"
+                        ? "Copy or download the tailored résumé. Plain text — no typeset PDF."
+                        : "The cut of the résumé against this opening."}
+                    </p>
+                  </div>
+                </div>
+                {packetBody}
+              </div>
+            ) : null}
+          </form>
+        </div>
+      </div>
     </div>
   );
 }
